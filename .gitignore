@@ -1,0 +1,6 @@
+cover.out
+
+/demo
+
+*.vecdb
+*.vecdb.hnsw
