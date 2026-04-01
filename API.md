@@ -157,6 +157,92 @@ type SearchOptions struct {
 - `Candidates` 控制的是“先从 HNSW 索引中取回多少个候选，再在这些候选里做后续打分和截断”，不是“从底层数据中只读取多少条再做全量匹配”
 - 如果走精确路径，例如 `Exact=true`、`Filter` 非空或内存索引失效，则由精确扫描逻辑决定遍历范围，此时 `Candidates` 不参与
 
+### MemoryLevel
+
+```go
+type MemoryLevel string
+```
+
+记忆系统使用的生命周期级别：
+
+- `MemoryLevelShortTerm`：默认过期时间 24 小时
+- `MemoryLevelSession`：默认过期时间 7 天
+- `MemoryLevelLongTerm`：默认不过期
+
+### Memory
+
+```go
+type Memory struct {
+	ID        string
+	Vector    []float32
+	Content   string
+	Level     MemoryLevel
+	Metadata  Metadata
+	CreatedAt time.Time
+	ExpiresAt time.Time
+}
+```
+
+表示一条带生命周期的记忆记录。
+
+- `Content` 为必填
+- `Level` 零值时默认视为 `MemoryLevelLongTerm`
+- `CreatedAt` 为空时自动使用当前时间
+- `ExpiresAt` 为空时按生命周期级别套用默认策略
+- 当前实现中，生命周期字段保存在底层文档 metadata 中，而记忆正文会单独存储在同一个 `.vecdb` 文件内
+
+### RecallOptions
+
+```go
+type RecallOptions struct {
+	Limit          int
+	MinScore       float64
+	Exact          bool
+	Candidates     int
+	Level          MemoryLevel
+	Filter         Metadata
+	IncludeExpired bool
+}
+```
+
+用于控制记忆召回行为。
+
+- `Level`：按生命周期级别过滤
+- `Filter`：按用户元数据做精确过滤
+- `IncludeExpired`：为 `true` 时允许返回已过期记忆
+
+### MemoryMatch
+
+```go
+type MemoryMatch struct {
+	ID        string
+	Content   string
+	Level     MemoryLevel
+	Metadata  Metadata
+	CreatedAt time.Time
+	ExpiresAt time.Time
+	Score     float64
+}
+```
+
+表示一条召回结果。
+
+### MemoryStoreOptions
+
+```go
+type MemoryStoreOptions struct {
+	Store        Options
+	ShortTermTTL time.Duration
+	SessionTTL   time.Duration
+}
+```
+
+用于打开记忆系统时覆盖默认 TTL。
+
+- `Store`：底层 vecdb 打开参数
+- `ShortTermTTL`：短期记忆默认 TTL，零值时默认 24 小时
+- `SessionTTL`：会话记忆默认 TTL，零值时默认 7 天
+
 ## 构造与生命周期接口
 
 ### Open
@@ -414,6 +500,119 @@ results, err := store.FindSimilar(queryEmbedding, vecdb.SearchOptions{
 - 再只对这些候选文档做精确余弦计算和 top-k 排序
 - 因此过滤结果保持精确，同时避免无条件全表扫描
 
+## 记忆系统接口
+
+记忆系统是构建在 `Store` 之上的一个轻量包装层，适合实现“短期 / 会话 / 长期”记忆。
+
+建议：
+
+- 为记忆系统使用独立的数据库文件
+- 不要在 `MemoryStore` 管理的底层库里混放普通 `Document`
+- 定期调用 `PruneExpired` 清理过期记忆
+
+过期语义：
+
+- 记忆到达 `ExpiresAt` 后，会被视为“逻辑过期”
+- 逻辑过期不会自动触发物理删除；底层记录会继续保留，直到显式调用 `PruneExpired`
+- `Recall` 默认不会返回已过期记忆
+- 只有当 `RecallOptions.IncludeExpired = true` 时，`Recall` 才会返回已过期记忆
+- `PruneExpired` 会同时删除过期记忆的向量记录和正文内容
+
+### OpenMemory
+
+```go
+func OpenMemory(path string, dimension int) (*MemoryStore, error)
+```
+
+使用默认生命周期策略打开一个记忆库。
+
+默认策略：
+
+- `short_term`：24 小时
+- `session`：7 天
+- `long_term`：不过期
+
+### OpenMemoryWithOptions
+
+```go
+func OpenMemoryWithOptions(options MemoryStoreOptions) (*MemoryStore, error)
+```
+
+使用自定义底层 `Store` 配置和 TTL 打开记忆库。
+
+### Remember
+
+```go
+func (m *MemoryStore) Remember(memory Memory) error
+```
+
+写入或覆盖一条记忆。
+
+### RememberMany
+
+```go
+func (m *MemoryStore) RememberMany(memories []Memory) error
+```
+
+批量写入记忆。
+
+### Get
+
+```go
+func (m *MemoryStore) Get(id string) (Memory, error)
+```
+
+按 ID 读取完整记忆。
+
+### Recall
+
+```go
+func (m *MemoryStore) Recall(query []float32, options RecallOptions) ([]MemoryMatch, error)
+```
+
+按向量召回记忆，并自动处理生命周期过滤。
+
+行为说明：
+
+- 默认不会返回已过期记忆
+- 底层已过期记录仍会保留，直到显式调用 `PruneExpired`
+- 当 `Level` 非空时，会先按级别过滤
+- 当 `Filter` 非空时，会继续按用户元数据做精确过滤
+- 当 `IncludeExpired=true` 时，允许返回已过期记忆
+- 如果过滤或过期剔除导致结果不足，内部会自动扩大抓取范围，尽量补足 `Limit`
+
+### Forget
+
+```go
+func (m *MemoryStore) Forget(id string) error
+```
+
+删除一条记忆。
+
+### PruneExpired
+
+```go
+func (m *MemoryStore) PruneExpired() (int, error)
+```
+
+清理所有已过期记忆，返回删除数量。
+
+补充说明：
+
+- 该方法执行的是物理删除
+- 会同时删除过期记忆对应的向量记录和正文内容
+
+### 代理接口
+
+记忆系统还提供以下透传方法：
+
+```go
+func (m *MemoryStore) Count() (int, error)
+func (m *MemoryStore) Dimension() int
+func (m *MemoryStore) RefreshIndex() error
+func (m *MemoryStore) Close() error
+```
+
 ## 错误约定
 
 库公开了以下错误值：
@@ -427,6 +626,10 @@ var (
 	ErrZeroVector
 	ErrInvalidVector
 	ErrNotFound
+	ErrInvalidMemoryLevel
+	ErrMemoryContentRequired
+	ErrReservedMemoryMetadataKey
+	ErrInvalidMemoryRecord
 )
 ```
 
@@ -439,6 +642,10 @@ var (
 - `ErrZeroVector`：查询向量范数为 0，无法计算余弦相似度
 - `ErrInvalidVector`：向量中包含 `NaN` 或 `Inf`
 - `ErrNotFound`：文档不存在
+- `ErrInvalidMemoryLevel`：记忆生命周期级别非法
+- `ErrMemoryContentRequired`：记忆内容为空
+- `ErrReservedMemoryMetadataKey`：用户元数据使用了记忆系统保留字段
+- `ErrInvalidMemoryRecord`：底层记录无法按记忆格式解码
 
 此外，接口还可能返回被包装的底层错误，例如：
 

@@ -12,6 +12,7 @@ It is designed to feel like a small reusable library:
 - simple document API: open, put, get, delete, count
 - HNSW approximate nearest-neighbor search with exact-search fallback
 - batch writes for loading and ingestion
+- optional memory-system wrapper with lifecycle levels and expiry pruning
 - small, explicit types for options and results
 
 ## Quick start
@@ -59,6 +60,61 @@ _ = results
 _ = exactResults
 ```
 
+## Memory system
+
+vecdb also includes a thin `MemoryStore` wrapper for lifecycle-aware memory:
+
+- `short_term`: expires after 24h by default
+- `session`: expires after 7d by default
+- `long_term`: no default expiry
+
+```go
+memory, err := vecdb.OpenMemory("./memory.vecdb", 384)
+if err != nil {
+	log.Fatal(err)
+}
+defer memory.Close()
+
+err = memory.Remember(vecdb.Memory{
+	ID:      "user-name",
+	Vector:  embedding,
+	Content: "The user's preferred name is Alice.",
+	Level:   vecdb.MemoryLevelLongTerm,
+	Metadata: vecdb.Metadata{
+		"topic": "profile",
+	},
+})
+if err != nil {
+	log.Fatal(err)
+}
+
+matches, err := memory.Recall(queryEmbedding, vecdb.RecallOptions{
+	Limit:  5,
+	Level:  vecdb.MemoryLevelLongTerm,
+	Filter: vecdb.Metadata{"topic": "profile"},
+})
+if err != nil {
+	log.Fatal(err)
+}
+
+removed, err := memory.PruneExpired()
+if err != nil {
+	log.Fatal(err)
+}
+
+_ = matches
+_ = removed
+```
+
+Use a dedicated file for memory records. The wrapper stores lifecycle fields in reserved metadata keys, stores memory content separately inside the same `.vecdb` file, and is meant to manage its own vecdb store.
+
+Expiry semantics:
+
+- an expired memory stays persisted until you call `PruneExpired()`
+- `Recall()` excludes expired memories by default
+- `Recall()` only returns expired memories when `RecallOptions.IncludeExpired` is `true`
+- `PruneExpired()` physically removes expired memories and their stored content
+
 ## API surface
 
 - Open(path, dimension)
@@ -75,6 +131,14 @@ _ = exactResults
 - RefreshIndex()
 - Dimension()
 - Close()
+- OpenMemory(path, dimension)
+- OpenMemoryWithOptions(options)
+- Remember(memory)
+- RememberMany(memories)
+- Get(id)
+- Recall(query, options)
+- Forget(id)
+- PruneExpired()
 
 ## Search behavior
 

@@ -2690,3 +2690,282 @@ func openTestStore(t *testing.T, dimension int) *Store {
 	}
 	return store
 }
+
+// --------------- Additional coverage tests ---------------
+
+func TestReadBinaryUvarintEdgeCases(t *testing.T) {
+	// Empty payload at offset
+	_, _, err := readBinaryUvarint([]byte{}, 0)
+	if err == nil || err.Error() != "unexpected end of payload" {
+		t.Fatalf("expected 'unexpected end of payload', got %v", err)
+	}
+
+	// Offset beyond payload
+	_, _, err = readBinaryUvarint([]byte{0x01}, 5)
+	if err == nil || err.Error() != "unexpected end of payload" {
+		t.Fatalf("expected 'unexpected end of payload', got %v", err)
+	}
+
+	// Varint overflow: 10 bytes of 0x80 triggers n<0
+	overflow := make([]byte, 11)
+	for i := range 10 {
+		overflow[i] = 0x80
+	}
+	overflow[10] = 0x01
+	_, _, err = readBinaryUvarint(overflow, 0)
+	if err == nil || err.Error() != "varint overflow" {
+		t.Fatalf("expected 'varint overflow', got %v", err)
+	}
+
+	// Truncated varint: single continuation byte with no terminator
+	_, _, err = readBinaryUvarint([]byte{0x80}, 0)
+	if err == nil || err.Error() != "truncated varint" {
+		t.Fatalf("expected 'truncated varint', got %v", err)
+	}
+}
+
+func TestReadBinaryStringTruncated(t *testing.T) {
+	// Build a payload claiming a string of length 100, but only 2 bytes remain.
+	var payload []byte
+	payload = appendBinaryUvarint(payload, 100) // length = 100
+	payload = append(payload, 0x41, 0x42)       // only 2 bytes
+	_, _, err := readBinaryString(payload, 0)
+	if err == nil || err.Error() != "truncated string" {
+		t.Fatalf("expected 'truncated string', got %v", err)
+	}
+}
+
+func TestSkipBinaryMetadataSectionTruncatedKey(t *testing.T) {
+	// Construct payload with magic, 1 metadata entry, then truncated key
+	payload := make([]byte, 0, 32)
+	payload = append(payload, binaryDocumentMagic...)
+	payload = appendBinaryUvarint(payload, 1)   // 1 metadata entry
+	payload = appendBinaryUvarint(payload, 100) // key length = 100 (truncated)
+	_, err := skipBinaryMetadataSection(payload)
+	if err == nil {
+		t.Fatal("expected truncated key error")
+	}
+}
+
+func TestSkipBinaryMetadataSectionTruncatedValue(t *testing.T) {
+	// Construct payload with magic, 1 metadata entry, valid key, then truncated value
+	payload := make([]byte, 0, 32)
+	payload = append(payload, binaryDocumentMagic...)
+	payload = appendBinaryUvarint(payload, 1)   // 1 metadata entry
+	payload = appendBinaryUvarint(payload, 3)   // key length = 3
+	payload = append(payload, "abc"...)         // key
+	payload = appendBinaryUvarint(payload, 200) // value length = 200 (truncated)
+	_, err := skipBinaryMetadataSection(payload)
+	if err == nil {
+		t.Fatal("expected truncated value error")
+	}
+}
+
+func TestSkipBinaryMetadataSectionOversizedCount(t *testing.T) {
+	payload := make([]byte, 0, 32)
+	payload = append(payload, binaryDocumentMagic...)
+	payload = appendBinaryUvarint(payload, 999999) // metadata count way too big
+	_, err := skipBinaryMetadataSection(payload)
+	if err == nil || err.Error() != "invalid metadata count" {
+		t.Fatalf("expected 'invalid metadata count', got %v", err)
+	}
+}
+
+func TestStoredVectorBytesCorruptedBinaryPayload(t *testing.T) {
+	// Dimension mismatch in binary format
+	store := openTestStore(t, 3)
+	t.Cleanup(func() { _ = store.Close() })
+
+	// Create a valid payload with dimension 3, then try to read it as dimension 5
+	doc := Document{ID: "test", Vector: []float32{1, 0, 0}, Metadata: Metadata{}}
+	payload, err := store.marshalDocument(doc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = storedVectorBytes(payload, 5) // wrong dimension
+	if err == nil {
+		t.Fatal("expected dimension mismatch error")
+	}
+}
+
+func TestStoredVectorEqualPayloadCorrupted(t *testing.T) {
+	// Test error path when left payload is corrupted
+	_, err := storedVectorEqualPayload([]byte("garbage"), []byte("garbage"), 3)
+	if err == nil {
+		t.Fatal("expected error for corrupted payload")
+	}
+}
+
+func TestUnmarshalStoredDocumentCorruptedBinaryVector(t *testing.T) {
+	store := openTestStore(t, 3)
+	t.Cleanup(func() { _ = store.Close() })
+
+	// Build payload with valid metadata but truncated vector bytes
+	payload := make([]byte, 0, 64)
+	payload = append(payload, binaryDocumentMagic...)
+	payload = appendBinaryUvarint(payload, 0) // 0 metadata entries
+	payload = appendBinaryUvarint(payload, 3) // vector dimension = 3
+	payload = append(payload, 0, 0, 0, 0)     // only 1 float (need 3)
+
+	_, err := store.unmarshalStoredDocument("corrupt", payload)
+	if err == nil {
+		t.Fatal("expected error for truncated vector bytes")
+	}
+}
+
+func TestUnmarshalStoredDocumentInvalidJSON(t *testing.T) {
+	store := openTestStore(t, 3)
+	t.Cleanup(func() { _ = store.Close() })
+
+	_, err := store.unmarshalStoredDocument("bad", []byte(`{invalid json`))
+	if err == nil {
+		t.Fatal("expected error for invalid JSON")
+	}
+}
+
+func TestUnmarshalStoredMetadataInvalidJSON(t *testing.T) {
+	store := openTestStore(t, 3)
+	t.Cleanup(func() { _ = store.Close() })
+
+	_, err := store.unmarshalStoredMetadata("bad", []byte(`not json`))
+	if err == nil {
+		t.Fatal("expected error for invalid JSON metadata")
+	}
+}
+
+func TestUnmarshalStoredMetadataCorruptedBinary(t *testing.T) {
+	store := openTestStore(t, 3)
+	t.Cleanup(func() { _ = store.Close() })
+
+	// Valid magic but truncated metadata
+	payload := make([]byte, 0, 16)
+	payload = append(payload, binaryDocumentMagic...)
+	payload = appendBinaryUvarint(payload, 1)   // 1 metadata entry
+	payload = appendBinaryUvarint(payload, 999) // key length too large
+	_, err := store.unmarshalStoredMetadata("corrupt", payload)
+	if err == nil {
+		t.Fatal("expected error for corrupted binary metadata")
+	}
+}
+
+func TestDecodeBinaryMetadataCorruptedKeyValue(t *testing.T) {
+	// Corrupted key read
+	payload := make([]byte, 0, 32)
+	payload = append(payload, binaryDocumentMagic...)
+	payload = appendBinaryUvarint(payload, 1)   // 1 entry
+	payload = appendBinaryUvarint(payload, 100) // key length too large
+	_, _, err := decodeBinaryMetadata(payload)
+	if err == nil {
+		t.Fatal("expected error for truncated metadata key")
+	}
+
+	// Corrupted value read
+	payload = make([]byte, 0, 32)
+	payload = append(payload, binaryDocumentMagic...)
+	payload = appendBinaryUvarint(payload, 1)   // 1 entry
+	payload = appendBinaryUvarint(payload, 1)   // key length = 1
+	payload = append(payload, 'k')              // key
+	payload = appendBinaryUvarint(payload, 200) // value length too large
+	_, _, err = decodeBinaryMetadata(payload)
+	if err == nil {
+		t.Fatal("expected error for truncated metadata value")
+	}
+}
+
+func TestSyncMetadataIndexAlreadySynced(t *testing.T) {
+	store := openTestStore(t, 3)
+	t.Cleanup(func() { _ = store.Close() })
+
+	// Put a document so metadata index is populated
+	if err := store.Put("doc1", []float32{1, 0, 0}, Metadata{"key": "val"}); err != nil {
+		t.Fatal(err)
+	}
+
+	// Calling syncMetadataIndex when already in sync should be a no-op
+	store.mu.Lock()
+	err := store.syncMetadataIndex()
+	store.mu.Unlock()
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestAddToIndexLockedWithNilIndex(t *testing.T) {
+	store := openTestStore(t, 3)
+	t.Cleanup(func() { _ = store.Close() })
+
+	store.mu.Lock()
+	store.index = nil
+	store.addToIndexLocked(Document{
+		ID: "test", Vector: []float32{1, 0, 0},
+	})
+	hasIndex := store.index != nil
+	store.mu.Unlock()
+
+	if !hasIndex {
+		t.Fatal("expected index to be created from nil")
+	}
+}
+
+func TestStoredVectorBytesJSONFormatWrongDimension(t *testing.T) {
+	// JSON format with wrong vector length
+	jsonPayload := []byte(`{"vector":"AAAAAA==","metadata":{}}`) // 4 bytes = 1 float
+	_, err := storedVectorBytes(jsonPayload, 3)                  // expecting 3 floats
+	if err == nil {
+		t.Fatal("expected dimension error for JSON format")
+	}
+}
+
+func TestFindSimilarFilterEmptyPostingIntersection(t *testing.T) {
+	store := openTestStore(t, 3)
+	t.Cleanup(func() { _ = store.Close() })
+
+	if err := store.Put("d1", []float32{1, 0, 0}, Metadata{"a": "1"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Put("d2", []float32{0, 1, 0}, Metadata{"b": "2"}); err != nil {
+		t.Fatal(err)
+	}
+
+	// Filter with both keys: no document has both, so intersection is empty
+	results, err := store.FindSimilar([]float32{1, 0, 0}, SearchOptions{
+		Limit:  5,
+		Filter: Metadata{"a": "1", "b": "2"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(results) != 0 {
+		t.Fatalf("expected 0 results, got %d", len(results))
+	}
+}
+
+func TestUpsertSameVectorDifferentMetadata(t *testing.T) {
+	store := openTestStore(t, 3)
+	t.Cleanup(func() { _ = store.Close() })
+
+	if err := store.Put("doc", []float32{1, 0, 0}, Metadata{"v": "1"}); err != nil {
+		t.Fatal(err)
+	}
+	// Same vector, different metadata — metadata-only update
+	if err := store.Put("doc", []float32{1, 0, 0}, Metadata{"v": "2"}); err != nil {
+		t.Fatal(err)
+	}
+
+	doc, err := store.Get("doc")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if doc.Metadata["v"] != "2" {
+		t.Fatalf("expected metadata 'v'='2', got %q", doc.Metadata["v"])
+	}
+}
+
+func TestRefreshIndexOnEmptyStore(t *testing.T) {
+	store := openTestStore(t, 3)
+	t.Cleanup(func() { _ = store.Close() })
+
+	if err := store.RefreshIndex(); err != nil {
+		t.Fatal(err)
+	}
+}
